@@ -41,6 +41,8 @@
 
 #include <sys/ioctl.h>
 
+#include <sys/queue.h>
+
 #define USB_STACK_VERSION 2
 
 #define USB_MAX_DEVICES 128
@@ -636,13 +638,25 @@ typedef struct usb_port_status usb_port_status_t;
 
 /*** ioctl() related stuff ***/
 
-struct usb_ctl_request {
-	int	ucr_addr;
-	usb_device_request_t ucr_request;
-	void	*ucr_data;
-	int	ucr_flags;
+struct usb_request_block {
+	usb_device_request_t 	 urb_request;
+	int	 		 urb_addr;
+	int		 	 urb_endpt;
+	void			*urb_data;
+	int			 urb_flags;
+#define USBD_NO_COPY		0x01	/* do not copy data to DMA buffer */
+#define USBD_SYNCHRONOUS	0x02	/* wait for completion */
 #define USBD_SHORT_XFER_OK	0x04	/* allow short reads */
-	int	ucr_actlen;		/* actual length transferred */
+#define USBD_FORCE_SHORT_XFER	0x08	/* force last short packet on write */
+#define USBD_CATCH		0x10	/* catch signals while sleeping */
+	int 			 urb_read;
+	int 			 urb_timeout;
+	int			 urb_actlen; /* actual length transferred */
+	int 			 urb_status;
+	void 			*urb_sc;
+	void			*urb_context;
+	void 			*urb_xfer;
+	TAILQ_ENTRY(usb_request_block) entries;
 };
 
 struct usb_alt_interface {
@@ -753,13 +767,14 @@ struct usb_device_stats {
 };
 
 /* USB controller */
-#define USB_REQUEST		_IOWR('U', 1, struct usb_ctl_request)
+#define USB_REQUEST		_IOWR('U', 1, struct usb_request_block)
 #define USB_SETDEBUG		_IOW ('U', 2, unsigned int)
 #define USB_DEVICEINFO		_IOWR('U', 4, struct usb_device_info)
 #define USB_DEVICESTATS		_IOR ('U', 5, struct usb_device_stats)
 #define USB_DEVICE_GET_CDESC	_IOWR('U', 6, struct usb_device_cdesc)
 #define USB_DEVICE_GET_FDESC	_IOWR('U', 7, struct usb_device_fdesc)
 #define USB_DEVICE_GET_DDESC	_IOWR('U', 8, struct usb_device_ddesc)
+#define USB_COMPLETED		_IOWR('U', 9, struct usb_request_block)
 
 /* Generic HID device */
 #define USB_GET_REPORT_DESC	_IOR ('U', 21, struct usb_ctl_report_desc)
@@ -778,9 +793,11 @@ struct usb_device_stats {
 #define USB_GET_INTERFACE_DESC	_IOWR('U', 107, struct usb_interface_desc)
 #define USB_GET_ENDPOINT_DESC	_IOWR('U', 108, struct usb_endpoint_desc)
 #define USB_GET_FULL_DESC	_IOWR('U', 109, struct usb_full_desc)
-#define USB_DO_REQUEST		_IOWR('U', 111, struct usb_ctl_request)
+#define USB_DO_REQUEST		_IOWR('U', 111, struct usb_request_block)
 #define USB_GET_DEVICEINFO	_IOR ('U', 112, struct usb_device_info)
 #define USB_SET_SHORT_XFER	_IOW ('U', 113, int)
 #define USB_SET_TIMEOUT		_IOW ('U', 114, int)
+#define USB_GET_COMPLETED	_IOWR('U', 115, struct usb_request_block)
+#define USB_DO_CANCEL		_IOWR('U', 116, struct usb_request_block)
 
 #endif /* _USB_H_ */

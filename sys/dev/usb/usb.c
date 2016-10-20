@@ -63,6 +63,7 @@
 #include <machine/bus.h>
 
 #include <dev/usb/usbdivar.h>
+#include <dev/usb/usb_mem.h>
 
 #ifdef USB_DEBUG
 #define DPRINTF(x)	do { if (usbdebug) printf x; } while (0)
@@ -96,6 +97,9 @@ struct usb_softc {
 	struct usb_task	 sc_explore_task;
 
 	struct timeval	 sc_ptime;
+
+	TAILQ_HEAD(, usb_request_block) complete_queue_head;
+	struct selinfo rsel;
 };
 
 struct rwlock usbpalock;
@@ -109,6 +113,7 @@ static int usb_run_tasks, usb_run_abort_tasks;
 int explore_pending;
 const char *usbrev_str[] = USBREV_STR;
 
+void usb_async_callback(struct usbd_xfer *, void *, usbd_status);
 void		 usb_explore(void *);
 void		 usb_create_task_threads(void *);
 void		 usb_task_thread(void *);
@@ -138,6 +143,40 @@ const struct cfattach usb_ca = {
 };
 
 int
+usbpoll(dev_t dev, int events, struct proc *p)
+{
+	int unit = minor(dev);
+	struct usb_softc *sc;
+	int revents = 0;
+	int s;
+
+	if (unit >= usb_cd.cd_ndevs)
+		return (ENXIO);
+	sc = usb_cd.cd_devs[unit];
+
+	s = splusb();
+	if (events & (POLLIN | POLLRDNORM)) {
+		if (!TAILQ_EMPTY(&sc->complete_queue_head))
+			revents |= events & (POLLIN | POLLRDNORM);
+		else
+			selrecord(p, &sc->rsel);
+	}
+	splx(s);
+	return (revents);
+}
+
+void
+usb_async_callback(struct usbd_xfer *xfer, void *priv, usbd_status s)
+{
+	struct usb_request_block *ur = priv;
+	struct usb_softc *sc = ur->urb_sc;
+
+	ur->urb_status = xfer->status;
+	TAILQ_INSERT_TAIL(&sc->complete_queue_head, ur, entries);
+	selwakeup(&sc->rsel);
+}
+
+int
 usb_match(struct device *parent, void *match, void *aux)
 {
 	return (1);
@@ -162,6 +201,7 @@ usb_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_bus = aux;
 	sc->sc_bus->usbctl = self;
 	sc->sc_port.power = USB_MAX_POWER;
+	TAILQ_INIT(&sc->complete_queue_head);
 
 	usbrev = sc->sc_bus->usbrev;
 	printf(": USB revision %s", usbrev_str[usbrev]);
@@ -609,18 +649,24 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 #endif /* USB_DEBUG */
 	case USB_REQUEST:
 	{
-		struct usb_ctl_request *ur = (void *)data;
-		size_t len = UGETW(ur->ucr_request.wLength);
+		struct usb_request_block *urb = (void *)data;
+		struct usb_request_block *kurb;
+		int len = urb->urb_actlen;
+		struct usbd_xfer *xfer;
 		struct iovec iov;
 		struct uio uio;
 		void *ptr = 0;
-		int addr = ur->ucr_addr;
+		int addr = urb->urb_addr;
 		usbd_status err;
 		int error = 0;
 
 		if (!(flag & FWRITE))
 			return (EBADF);
 
+		if (urb->urb_endpt < 0 || urb->urb_endpt > USB_MAX_ENDPOINTS)
+			return (EINVAL);
+		if (urb->urb_endpt != USB_CONTROL_ENDPOINT)
+			return (EINVAL);
 		DPRINTF(("usbioctl: USB_REQUEST addr=%d len=%zu\n", addr, len));
 		/* Avoid requests that would damage the bus integrity. */
 		if ((ur->ucr_request.bmRequestType == UT_WRITE_DEVICE &&
@@ -631,54 +677,149 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 		     ur->ucr_request.bRequest == UR_SET_INTERFACE))
 			return (EINVAL);
 
-		if (len > 32767)
+		if (len < 0 || > 32767)
 			return (EINVAL);
 		if (addr < 0 || addr >= USB_MAX_DEVICES)
 			return (EINVAL);
 		if (sc->sc_bus->devices[addr] == NULL)
 			return (ENXIO);
+		if (usbd_is_dying(sc->sc_bus->devices[addr]))
+			return (EIO);
+		xfer = usbd_alloc_xfer(sc->sc_bus->devices[addr]);
+		if (xfer == NULL)
+			return (ENOMEM);
 		if (len != 0) {
-			iov.iov_base = (caddr_t)ur->ucr_data;
+			iov.iov_base = (caddr_t)urb->urb_data;
 			iov.iov_len = len;
 			uio.uio_iov = &iov;
 			uio.uio_iovcnt = 1;
 			uio.uio_resid = len;
 			uio.uio_offset = 0;
 			uio.uio_segflg = UIO_USERSPACE;
-			uio.uio_rw =
-				ur->ucr_request.bmRequestType & UT_READ ?
-				UIO_READ : UIO_WRITE;
+			uio.uio_rw = urb->urb_read ? UIO_READ : UIO_WRITE;
 			uio.uio_procp = p;
-			ptr = malloc(len, M_TEMP, M_WAITOK);
+			ptr = usbd_alloc_buffer(xfer, len);
+			if (ptr == NULL) {
+				usbd_free_xfer(xfer);
+				return (ENOMEM);
+			}
 			if (uio.uio_rw == UIO_WRITE) {
 				error = uiomove(ptr, len, &uio);
-				if (error)
-					goto ret;
+				if (error) {
+					usbd_free_xfer(xfer);
+					return (error);
+				}
 			}
 		}
-		err = usbd_do_request_flags(sc->sc_bus->devices[addr],
-			  &ur->ucr_request, ptr, ur->ucr_flags,
-			  &ur->ucr_actlen, USBD_DEFAULT_TIMEOUT);
-		if (err) {
-			error = EIO;
-			goto ret;
-		}
-		/* Only if USBD_SHORT_XFER_OK is set. */
-		if (len > ur->ucr_actlen)
-			len = ur->ucr_actlen;
-		if (len != 0) {
-			if (uio.uio_rw == UIO_READ) {
-				error = uiomove(ptr, len, &uio);
-				if (error)
-					goto ret;
+		if (urb->urb_flags & USBD_SYNCHRONOUS) {
+			usbd_setup_default_xfer(xfer,
+			    sc->sc_bus->devices[addr],
+			    NULL, urb->urb_timeout, &urb->urb_request,
+			    NULL, len, urb->urb_flags | USBD_NO_COPY,
+			    NULL);
+			err = usbd_transfer(xfer);
+			if (err) {
+				if (err == USBD_INTERRUPTED)
+					error = EINTR;
+				else if (err == USBD_TIMEOUT)
+					error = ETIMEDOUT;
+				else
+					error = EIO;
+				usbd_free_xfer(xfer);
+				return (error);
 			}
+			urb->urb_actlen = xfer->actlen;
+			len = urb->urb_actlen;
+			if (len != 0) {
+				iov.iov_base = (caddr_t)urb->urb_data;
+				iov.iov_len = len;
+				uio.uio_iov = &iov;
+				uio.uio_iovcnt = 1;
+				uio.uio_resid = len;
+				uio.uio_offset = 0;
+				uio.uio_segflg = UIO_USERSPACE;
+				uio.uio_rw = urb->urb_read ?
+				    UIO_READ : UIO_WRITE;
+				uio.uio_procp = p;
+				if (uio.uio_rw == UIO_READ)
+					error = uiomovei(ptr, len, &uio);
+			}
+			usbd_free_xfer(xfer);
+			return (error);
 		}
-	ret:
-		if (ptr)
-			free(ptr, M_TEMP, 0);
+		urb->urb_sc = sc;
+		kurb = malloc(sizeof(*kurb), M_TEMP, M_WAITOK);
+		if (kurb == NULL) {
+			usbd_free_xfer(xfer);
+			return (ENOMEM);
+		}
+		*kurb = *urb;
+		kurb->urb_xfer = xfer;
+		usbd_setup_default_xfer(xfer,
+		    sc->sc_bus->devices[addr], kurb, urb->urb_timeout,
+		    &urb->urb_request, NULL, len,
+		    urb->urb_flags | USBD_NO_COPY, usb_async_callback);
+		err = usbd_transfer(xfer);
+		if (err != USBD_IN_PROGRESS) {
+			free(kurb, M_TEMP, sizeof(*kurb));
+			usbd_free_xfer(xfer);
+			return (EIO);
+		}
 		return (error);
 	}
+	case USB_COMPLETED:
+	{
+		struct usb_request_block *urb = (void *)data;
+		struct usb_request_block *kurb;
+		struct usbd_xfer *xfer;
+		void *buf;
+		struct uio uio;
+		struct iovec iov;
+		int len;
+		int s;
+		int error = 0;
 
+		s = splusb();
+		kurb = TAILQ_FIRST(&sc->complete_queue_head);
+		if (kurb == NULL) {
+			splx(s);
+			return (EIO);
+		}
+		TAILQ_REMOVE(&sc->complete_queue_head, kurb, entries);
+		splx(s);
+
+		xfer = kurb->urb_xfer;
+		if (kurb->urb_status == USBD_NORMAL_COMPLETION) {
+			len = kurb->urb_actlen;
+			if (len > xfer->actlen)
+				len = xfer->actlen;
+			kurb->urb_actlen = len;
+			if (len != 0) {
+				iov.iov_base = (caddr_t)kurb->urb_data;
+				iov.iov_len = len;
+				uio.uio_iov = &iov;
+				uio.uio_iovcnt = 1;
+				uio.uio_resid = len;
+				uio.uio_offset = 0;
+				uio.uio_segflg = UIO_USERSPACE;
+				uio.uio_rw = kurb->urb_read ?
+				    UIO_READ : UIO_WRITE;
+				uio.uio_procp = p;
+				if (uio.uio_rw == UIO_READ) {
+					buf = KERNADDR(&xfer->dmabuf, 0);
+					error = uiomovei(buf, len, &uio);
+					if (error)
+						kurb->urb_status =
+						    USBD_IOERROR;
+				}
+			}
+		}
+		usbd_free_xfer(xfer);
+
+		*urb = *kurb;
+		free(kurb, M_TEMP, sizeof(*kurb));
+		return (0);
+	}
 	case USB_DEVICEINFO:
 	{
 		struct usb_device_info *di = (void *)data;
